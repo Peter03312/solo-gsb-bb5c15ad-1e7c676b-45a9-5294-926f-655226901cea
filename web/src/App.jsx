@@ -6,9 +6,11 @@ import Results from './components/Results.jsx';
 import Review from './components/Review.jsx';
 import Appeal from './components/Appeal.jsx';
 import Publish from './components/Publish.jsx';
+import Stoppages from './components/Stoppages.jsx';
 
 const TABS = [
   { key: 'results', label: '成绩排名' },
+  { key: 'stoppages', label: '停表区间' },
   { key: 'appeal', label: '整案申诉' },
   { key: 'review', label: '争议复核' },
   { key: 'import', label: '打卡导入' },
@@ -81,6 +83,7 @@ export default function App() {
         {tab === 'setup' && <Setup event={event} onChanged={refreshEvent} onError={showStale} />}
         {tab === 'import' && <Import event={event} onChanged={refreshEvent} onError={showStale} />}
         {tab === 'results' && <Results />}
+        {tab === 'stoppages' && <Stoppages event={event} onChanged={refreshEvent} onError={showStale} />}
         {tab === 'appeal' && <Appeal event={event} onChanged={refreshEvent} onError={showStale} />}
         {tab === 'review' && <Review event={event} onChanged={refreshEvent} onError={showStale} />}
         {tab === 'publish' && <Publish event={event} onChanged={refreshEvent} onError={showStale} />}

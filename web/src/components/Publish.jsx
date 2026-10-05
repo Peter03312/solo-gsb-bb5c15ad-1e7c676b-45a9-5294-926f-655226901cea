@@ -76,6 +76,12 @@ export default function Publish({ event, onChanged, onError }) {
                 {viewing.config.groups.map(g => (
                   <li key={g.seq}>第 {g.seq} 组 {g.name}（{g.cutoffSecs == null ? '无组截止' : `截止 ${g.cutoffSecs}s`}）：{g.points.join(' / ')}</li>
                 ))}
+                <li>
+                  冻结停表区间：
+                  {(viewing.stoppages || []).length === 0
+                    ? '无'
+                    : viewing.stoppages.map(s => `${s.startSecs}s–${s.endSecs}s`).join('，')}
+                </li>
               </ul>
               <h4>冻结有效读数（{viewing.readings.length} 条）</h4>
               <div className="readings">
@@ -85,9 +91,9 @@ export default function Publish({ event, onChanged, onError }) {
               </div>
             </div>
             <div>
-              <h4>冻结成绩</h4>
+              <h4>冻结成绩（按冻结停表区间的净耗时排名）</h4>
               <table className="grid compact">
-                <thead><tr><th>名次</th><th>号码</th><th>状态</th><th>耗时</th><th>说明</th></tr></thead>
+                <thead><tr><th>名次</th><th>号码</th><th>状态</th><th>原始耗时</th><th>净耗时</th><th>说明</th></tr></thead>
                 <tbody>
                   {viewing.results.map(r => (
                     <tr key={r.bib}>
@@ -95,6 +101,7 @@ export default function Publish({ event, onChanged, onError }) {
                       <td>{r.bib}</td>
                       <td>{STATUS_LABEL[r.status] || r.status}</td>
                       <td>{r.elapsed != null ? `${fmtTime(r.elapsed)}（${r.elapsed}s）` : '—'}</td>
+                      <td>{r.netElapsed != null ? <b>{`${fmtTime(r.netElapsed)}（${r.netElapsed}s）`}</b> : '—'}</td>
                       <td className="small muted">{r.detail}{r.failAt ? `（${r.failAt}）` : ''}</td>
                     </tr>
                   ))}

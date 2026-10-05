@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getDb, initDb, bumpRevision, currentRevision } from './db.mjs';
-import { loadConfig, computeResults } from './scoring.mjs';
+import { loadConfig, computeResults, mergeIntervals } from './scoring.mjs';
 import {
   validateOperations, canonicalOps, signPreview, verifyPreview,
   previewCase, commitCase,
@@ -58,6 +58,8 @@ app.get('/api/event', (req, res) => {
       cutoffSecs: g.cutoff_secs,
       points: g.points,
     })),
+    // 统一停表区间（已合并的不交并集）
+    stoppages: cfg.stoppages.map((s) => ({ startSecs: s.start, endSecs: s.end })),
   });
 });
 
@@ -115,7 +117,75 @@ app.post('/api/setup', (req, res) => {
   res.json({ ok: true, revision: rev });
 });
 
-// ---------- 打卡导入 ----------
+// ---------- 统一停表区间 ----------
+/** 规范化并整次校验停表区间；任一非法返回 { error }（整次拒绝，不部分写入）。 */
+function parseStoppages(raw) {
+  if (!Array.isArray(raw)) return { error: 'stoppages 须为数组（可空，空数组表示清除全部区间）' };
+  const list = [];
+  for (let i = 0; i < raw.length; i++) {
+    const s = raw[i];
+    const where = `第 ${i + 1} 个区间`;
+    if (!s || typeof s !== 'object') return { error: `${where} 格式非法，整次拒绝` };
+    const start = s.startSecs;
+    const end = s.endSecs;
+    if (!Number.isInteger(start) || !Number.isInteger(end))
+      return { error: `${where}：起止秒数须为非负整数，整次拒绝` };
+    if (start < 0 || end < 0)
+      return { error: `${where}：起止秒数不能为负，整次拒绝` };
+    if (start >= end)
+      return { error: `${where}：起点（${start}）必须小于终点（${end}），整次拒绝` };
+    list.push({ start, end });
+  }
+  // 统一合并重叠/相邻区间后存储与比较（重叠区间只计一次）
+  return { intervals: mergeIntervals(list) };
+}
+
+function intervalsEqual(a, b) {
+  return a.length === b.length && a.every((x, i) => x.start === b[i].start && x.end === b[i].end);
+}
+
+app.get('/api/stoppages', (req, res) => {
+  const cfg = loadConfig(db);
+  if (!cfg) return res.json({ configured: false, revision: 0, stoppages: [] });
+  res.json({
+    configured: true,
+    revision: cfg.revision,
+    stoppages: cfg.stoppages.map((s) => ({ startSecs: s.start, endSecs: s.end })),
+  });
+});
+
+/**
+ * POST /api/stoppages 整体替换停表区间集合：
+ * body: { expectedRevision, stoppages: [{ startSecs, endSecs }, ...] }
+ * 任一区间非法（非整数/负数/起点≥终点）=> 400 整次拒绝（不部分写入）；
+ * 修订号过期 => 409 + currentRevision；提交内容与现有并集完全相同 => 只读，不推进修订。
+ */
+app.post('/api/stoppages', (req, res) => {
+  if (!checkRevision(req, res)) return;
+  if (!loadConfig(db)) return badRequest(res, '赛事尚未配置，请先设置关卡组');
+  const parsed = parseStoppages(req.body?.stoppages);
+  if (parsed.error) return badRequest(res, parsed.error);
+  const next = parsed.intervals;
+
+  const cur = mergeIntervals(
+    db.prepare('SELECT start_secs AS start, end_secs AS end FROM stoppage_interval').all()
+  );
+  let revision = currentRevision(db);
+  if (!intervalsEqual(cur, next)) {
+    revision = db.transaction(() => {
+      db.prepare('DELETE FROM stoppage_interval').run();
+      const ins = db.prepare('INSERT INTO stoppage_interval (start_secs, end_secs) VALUES (?, ?)');
+      for (const iv of next) ins.run(iv.start, iv.end);
+      return bumpRevision(db);
+    })();
+  }
+  res.json({
+    ok: true,
+    revision,
+    changed: !intervalsEqual(cur, next),
+    stoppages: next.map((s) => ({ startSecs: s.start, endSecs: s.end })),
+  });
+});
 /**
  * 整批校验：负秒数、同记录号异「原始内容」=> 整批拒绝（事务回滚）。
  * 同号判定以该记录号【首次入库时】的原始读数（bib/point/seconds/kind）为准，
@@ -225,6 +295,7 @@ app.get('/api/results', (req, res) => {
     finishPoint: cfg.finish_point,
     finishCutoff: cfg.finish_cutoff,
     groups: cfg.groups.map((g) => ({ name: g.name, seq: g.seq, cutoffSecs: g.cutoff_secs, points: g.points })),
+    stoppages: cfg.stoppages.map((s) => ({ startSecs: s.start, endSecs: s.end })),
     results,
   });
 });
@@ -374,18 +445,21 @@ app.post('/api/publications', (req, res) => {
       finishCutoff: cfg.finish_cutoff,
       groups: cfg.groups.map((g) => ({ seq: g.seq, name: g.name, cutoffSecs: g.cutoff_secs, points: g.points })),
     });
+    // 冻结发布当时的停表区间并集；后续调整不改历史版
+    const stoppages = cfg.stoppages.map((s) => ({ startSecs: s.start, endSecs: s.end }));
+    const stoppagesJson = JSON.stringify(stoppages);
     const readingsJson = JSON.stringify(readings);
     const resultsJson = JSON.stringify(results);
     db.prepare(
-      `INSERT INTO publication (version, event_revision, note, config_json, readings_json, results_json)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    ).run(version, cfg.revision, note, configJson, readingsJson, resultsJson);
+      `INSERT INTO publication (version, event_revision, note, config_json, stoppages_json, readings_json, results_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(version, cfg.revision, note, configJson, stoppagesJson, readingsJson, resultsJson);
     const insR = db.prepare(
-      `INSERT INTO published_result (publication_version, bib, name, status, elapsed, fail_at, detail, rank_no)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO published_result (publication_version, bib, name, status, elapsed, net_elapsed, fail_at, detail, rank_no)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     for (const r of results)
-      insR.run(version, r.bib, r.name, r.status, r.elapsed, r.failAt ?? null, r.detail, r.rank ?? null);
+      insR.run(version, r.bib, r.name, r.status, r.elapsed, r.netElapsed ?? null, r.failAt ?? null, r.detail, r.rank ?? null);
     // 发布本身冻结快照；继续推进修订号，使旧页面的导入/发布请求走过期核对
     const rev = bumpRevision(db);
     return { version, rev };
@@ -412,6 +486,7 @@ app.get('/api/publications/:version', (req, res) => {
     publishedAt: row.published_at,
     note: row.note,
     config: JSON.parse(row.config_json),
+    stoppages: JSON.parse(row.stoppages_json || '[]'),
     readings: JSON.parse(row.readings_json),
     results: JSON.parse(row.results_json),
   });

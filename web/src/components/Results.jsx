@@ -37,10 +37,24 @@ export default function Results() {
         起点 <b>{data.startPoint}</b> · 终点 <b>{data.finishPoint}</b> · 终点截止{' '}
         <b>{data.finishCutoff}s（{fmtTime(data.finishCutoff)}）</b> · 实时修订 #{data.revision}
       </p>
+      <p className="muted small">
+        统一停表（按并集只计一次）：
+        {(data.stoppages || []).length === 0 ? (
+          <b>无</b>
+        ) : (
+          data.stoppages.map((s, i) => (
+            <span className="chip" key={i} style={{ marginLeft: 4 }}>
+              {s.startSecs}s–{s.endSecs}s<small>{s.endSecs - s.startSecs}s</small>
+            </span>
+          ))
+        )}
+        ；排名与并列按<b>净耗时</b>，关卡/终点截止与有效链仍按原始秒数判定。
+      </p>
       <table className="grid">
         <thead>
           <tr>
-            <th>名次</th><th>号码布</th><th>姓名</th><th>状态</th><th>耗时</th>
+            <th>名次</th><th>号码布</th><th>姓名</th><th>状态</th>
+            <th>原始耗时</th><th>停表扣减</th><th>净耗时</th>
             <th>首个未完成 / 说明</th><th className="chain-col">最早有效链</th>
           </tr>
         </thead>
@@ -54,6 +68,12 @@ export default function Results() {
                 <td>{r.name || '—'}</td>
                 <td><span className={`badge ${st.cls}`}>{st.text}</span></td>
                 <td>{r.elapsed != null ? `${fmtTime(r.elapsed)}（${r.elapsed}s）` : '—'}</td>
+                <td>{r.stoppedSecs ? `${r.stoppedSecs}s` : (r.status === 'ok' ? '0s' : '—')}</td>
+                <td>
+                  {r.netElapsed != null
+                    ? <b>{`${fmtTime(r.netElapsed)}（${r.netElapsed}s）`}</b>
+                    : <span className="muted">未完赛无净耗时</span>}
+                </td>
                 <td>{r.failAt ? <><b>{r.failAt}</b>：{r.detail}</> : r.detail || '—'}</td>
                 <td className="chain">
                   {r.chain.map((c, i) => (
@@ -72,7 +92,8 @@ export default function Results() {
       </table>
       <p className="muted small">
         规则：打卡时间相对发枪秒数须严格递增，按关卡组顺序每组在可替代点位中选最早一条；
-        逆序及多余打卡不作完成依据。同耗时并列同名次。
+        逆序及多余打卡不作完成依据。净耗时 = 原始耗时 − 停表区间并集与本人出发→终点区间的交长，
+        同净耗时并列同名次；原始耗时（elapsed）语义不变。
       </p>
     </div>
   );

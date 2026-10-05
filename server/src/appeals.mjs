@@ -158,6 +158,8 @@ const slimResult = (r) => ({
   name: r.name ?? null,
   status: r.status,
   elapsed: r.elapsed ?? null,
+  netElapsed: r.netElapsed ?? null,
+  stoppedSecs: r.stoppedSecs ?? null,
   rank: r.rank ?? null,
   failAt: r.failAt ?? null,
   detail: r.detail ?? '',
@@ -179,6 +181,7 @@ function resultChanged(a, b) {
   return (
     a.status !== b.status ||
     (a.elapsed ?? null) !== (b.elapsed ?? null) ||
+    (a.netElapsed ?? null) !== (b.netElapsed ?? null) ||
     (a.rank ?? null) !== (b.rank ?? null) ||
     (a.failAt ?? null) !== (b.failAt ?? null) ||
     a.detail !== b.detail ||

@@ -20,6 +20,10 @@ export function seedDemo(db) {
     insPt.run(g1, 'A1', 1); insPt.run(g1, 'A2', 2);
     insPt.run(g2, 'B1', 1); insPt.run(g2, 'B2', 2);
 
+    // 天气原因统一停表：距发枪 500s–600s（重叠区间只计一次；净耗时排名时扣减）
+    const insStop = db.prepare('INSERT INTO stoppage_interval (start_secs, end_secs) VALUES (?, ?)');
+    insStop.run(500, 600);
+
     const insRunner = db.prepare('INSERT INTO runner (bib, name) VALUES (?, ?)');
     insRunner.run('001', '张明'); insRunner.run('002', '李华');
     insRunner.run('003', '王芳'); insRunner.run('004', '赵强');

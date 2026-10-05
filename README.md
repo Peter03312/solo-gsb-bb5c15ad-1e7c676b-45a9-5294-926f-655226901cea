@@ -4,6 +4,12 @@
 系统录入选手的**唯一出发打卡**以及途中、终点打卡（每条含记录号、点位、距发枪秒数），自动核算成绩、
 支持裁判作废/更正打卡并**重算**，以及**发布冻结**成绩版本。
 
+**统一停表（本轮新增）**：赛事因天气等原因统一停表时，裁判可登记若干**距发枪秒数**表示的停表区间
+（起止均为非负整数、起点小于终点，重叠区间只计一次）；完成选手的**净耗时 = 原始耗时 −
+停表区间并集与其「出发→终点」区间的交长**，排名与并列按净耗时；`elapsed` 仍为原始耗时，另返回 `netElapsed`，
+未完赛者无净耗时。关卡/终点截止与有效链仍按原始秒数判定。停表配置变动须携带 `expectedRevision`，
+无效区间整次拒绝；发布版冻结当时的停表区间与净耗时，后续调整不改历史版。
+
 技术栈：**Node.js + Express + React（Vite）+ SQLite（better-sqlite3）**。
 
 ---
@@ -83,11 +89,69 @@ npm start          # http://localhost:3000
    - 若该组设置了组截止秒数，还须不晚于该秒数。
 3. 终点打卡必须在最后一组之后、且距发枪秒数不超过终点截止秒数（`<=`，刚好在截止点有效）。
 4. **逆序打卡与多余打卡**（如途中再次经过起点、无关点位、晚于终点的打卡）不作为任何组/终点的完成依据。
-5. 完成者按耗时（终点秒数 − 出发秒数）升序排名，**同耗时并列同名次**。
+5. 完成者按**净耗时**升序排名，**同净耗时并列同名次**；`elapsed`（原始耗时 = 终点秒数 − 出发秒数）语义不变，
+   另返回 `netElapsed`（净耗时）与 `stoppedSecs`（被扣减的停表秒数），未完赛者净耗时为 `null`。
 6. 无有效链时指出首个失败位置：
    - 出发缺失/不唯一/点位错误；
    - 第一个未在严格递增且截止前通过的关卡组（含组名与原因）；
    - 终点缺失或**终点超时**（给出实际秒数与截止值）。
+
+## 统一停表与净耗时（本轮新增）
+
+赛事因天气等原因**统一停表**时，按「距发枪秒数」登记停表区间，规则如下：
+
+1. 每个区间为 `{ startSecs, endSecs }`，起止均为**非负整数**且 `startSecs < endSecs`（半开 `[start,end)`，
+   秒为整数时与闭区间等长）。**任一区间非法 → 整次请求 400 拒绝**（不会部分写入）。
+2. 登记区间允许交叠/相邻，存储与核算统一取**并集**（`mergeIntervals`），重叠部分**只计一次**。
+3. 完成选手 `netElapsed = elapsed − |停表并集 ∩ [出发秒数, 终点秒数]|`；
+   出发前/终点后的停表时间不计；**关卡与终点截止、有效链仍按原始秒数判定**（停表不影响是否完赛）。
+4. **未完赛者无净耗时**（`netElapsed`/`stoppedSecs` 均为 `null`），不参与排名。
+5. 排名、并列、整案预演/确认前后对比都按净耗时同一规则；`elapsed` 字段含义不变（兼容旧调用方）。
+6. 停表配置是赛事单例集合，**整体替换**维护；变动须携带 `expectedRevision`，过期返回 **409 + `currentRevision`**；
+   提交内容与现有并集完全相同（含交叠去重后相同）时为只读操作，**不推进修订号**。
+7. **发布冻结**当时的停表区间并集与据此算出的净耗时（`stoppages` 进入快照，`published_result.net_elapsed` 落库）；
+   之后再调整停表区间，历史版本的区间与净耗时都不变。
+8. 旧数据库首次启动自动迁移：新建 `stoppage_interval` 表；为历史 `publication` 回填空区间、
+   为历史 `published_result` 回填 `net_elapsed = elapsed`（旧版发布时无停表，净耗时即原始耗时）。
+
+### 停表区间 HTTP 调用示例
+
+```bash
+# 1) 查询当前停表区间（已合并的不交并集）与修订号
+curl -s http://localhost:3000/api/stoppages
+# -> { "configured": true, "revision": 4,
+#      "stoppages": [ { "startSecs": 500, "endSecs": 600 } ] }
+
+# 2) 整体替换停表区间（须携带 expectedRevision）
+curl -s -X POST http://localhost:3000/api/stoppages \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expectedRevision": 4,
+    "stoppages": [
+      { "startSecs": 500, "endSecs": 620 },
+      { "startSecs": 600, "endSecs": 700 }
+    ]
+  }'
+# 交叠/相邻区间合并后落库并推进修订：
+# -> { "ok": true, "revision": 5, "changed": true,
+#      "stoppages": [ { "startSecs": 500, "endSecs": 700 } ] }
+
+# 3) 清空全部停表（空数组合法；有效变更同样推进修订）
+curl -s -X POST http://localhost:3000/api/stoppages \
+  -H 'Content-Type: application/json' -d '{"expectedRevision":5,"stoppages":[]}'
+
+# 4) 实时成绩同时返回原始耗时与净耗时
+curl -s http://localhost:3000/api/results
+# -> { "stoppages": [...], "results": [
+#      { "bib":"001", "status":"ok", "elapsed":910,
+#        "stoppedSecs":100, "netElapsed":810, "rank":1, "chain":[...] },
+#      { "bib":"002", "status":"finish_dnf", "elapsed":null,
+#        "netElapsed":null, "stoppedSecs":null, ... } ] }
+
+# 5) 无效区间整次拒绝 / 修订过期
+# HTTP/1.1 400 -> { "error": "第 2 个区间：起点（700）必须小于终点（600），整次拒绝" }
+# HTTP/1.1 409 -> { "error": "赛事已修订，请刷新后重试", "currentRevision": 6 }
+```
 
 ## 裁判操作（争议复核）
 
@@ -117,12 +181,13 @@ npm start          # http://localhost:3000
 
 ## 发布冻结与赛事修订
 
-- 每次关卡设置、批量导入（确有新增时）、作废/更正、发布都会推进赛事 `revision` 修订号；
-  导入全部为幂等跳过时为只读操作，不推进修订号。
-- 导入与发布必须在请求中携带 `expectedRevision`；与当前修订不一致时返回 **HTTP 409 及 `currentRevision`**（前端提示刷新），
-  避免覆盖他人更改。
-- 发布将**关卡配置 + 全部有效读数（作废读数除外）+ 当次成绩**整体快照写入 `publication` /
-  `published_result` 表，版本号递增；历史版只读，后续更正/作废/重导**不修改任何历史版**。
+- 每次关卡设置、停表区间变动、批量导入（确有新增时）、作废/更正、发布都会推进赛事 `revision` 修订号；
+  导入全部为幂等跳过、停表保存后并集无变化时为只读操作，不推进修订号。
+- 导入、发布与停表配置必须在请求中携带 `expectedRevision`；与当前修订不一致时返回 **HTTP 409 及 `currentRevision`**
+  （前端提示刷新），避免覆盖他人更改。
+- 发布将**关卡配置 + 停表区间 + 全部有效读数（作废读数除外）+ 当次成绩（含净耗时）**整体快照写入
+  `publication` / `published_result` 表，版本号递增；历史版只读，后续更正/作废/重导/停表调整
+  **不修改任何历史版**。
 - 批量导入校验：
   - 秒数必须为非负整数，出现**负秒数 → 整批拒绝**；
   - **同号异「原始内容」→ 整批拒绝**：同记录号判定以该记录号**首次入库时**的
@@ -202,7 +267,7 @@ curl -s -X POST http://localhost:3000/api/punches/import \
 其他常用接口：
 
 ```bash
-# 实时成绩（沿用裁判更正后的现值；作废读数不参与）
+# 实时成绩（沿用裁判更正后的现值；作废读数不参与；elapsed 为原始耗时，netElapsed 为净耗时）
 curl -s http://localhost:3000/api/results
 
 # 打卡与审计（含首次入库的 orig_point/orig_seconds 原始读数）
@@ -250,7 +315,8 @@ curl -s -X POST http://localhost:3000/api/appeals/preview \
 #      "affected": [
 #        { "bib": "090", "direct": true,  "changed": true,
 #          "before": { "status": "bad_start", ... },
-#          "after":  { "status": "ok", "elapsed": 650, "rank": 1, ... },
+#          "after":  { "status": "ok", "elapsed": 650, "stoppedSecs": 100,
+#                      "netElapsed": 550, "rank": 1, ... },
 #          "chainDiff": { "added": [...], "removed": [...] } },
 #        { "bib": "091", "direct": false, "changed": true,
 #          "before": { "rank": 1, ... }, "after": { "rank": 2, ... },
@@ -279,43 +345,46 @@ curl -s -X POST http://localhost:3000/api/appeals/confirm \
 
 ## 页面说明
 
-- **成绩排名**：实时成绩、名次（含并列）、状态、失败组/超时说明、每人的最早有效链。
+- **成绩排名**：实时成绩、按净耗时的名次（含并列）、状态、失败组/超时说明、原始耗时/停表扣减/净耗时、每人的最早有效链。
+- **停表区间**：整体维护距发枪秒数表示的停表区间（客户端即时校验、预览合并后的并集），保存携带修订号。
 - **整案申诉**：按号码布挑选多条打卡组成同一申诉，逐条作废/更正并填原因；先预演查看所有受影响选手
-  （含名次联动者）处理前后的成绩、名次、失败原因与有效链差异，再一次性原子确认。
+  （含名次联动者）处理前后的成绩（原始/净耗时）、名次、失败原因与有效链差异，再一次性原子确认。
 - **争议复核**：按号码布查看打卡，执行单条作废/更正并查看完整操作留痕。
 - **打卡导入**：批量粘贴导入，展示整批校验结果。
 - **关卡设置**：维护起点/终点、终点截止、顺序关卡组、组内替代点位与组截止。
-- **发布冻结**：发布新版本、浏览各历史冻结版的关卡/读数/成绩。
+- **发布冻结**：发布新版本、浏览各历史冻结版的关卡/停表区间/读数/成绩（含冻结的净耗时）。
 
 ## 主要 API
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/event` | 当前赛事配置与修订号 |
+| GET | `/api/event` | 当前赛事配置、停表区间与修订号 |
 | POST | `/api/setup` | 设置关卡组（body 需 `expectedRevision`） |
+| GET | `/api/stoppages` | 当前停表区间并集与修订号 |
+| POST | `/api/stoppages` | 整体替换停表区间（需 `expectedRevision`；无效区间 400 整次拒绝，过期 409） |
 | POST | `/api/punches/import` | 批量导入（按首次入库原始读数幂等；冲突整批拒绝，409 过期 / 400 拒绝） |
 | GET | `/api/punches?bib=` | 打卡与审计记录 |
 | POST | `/api/punches/:id/void` | 作废（reason 必填） |
 | POST | `/api/punches/:id/correct` | 更正（newPoint/newSeconds/reason） |
 | POST | `/api/appeals/preview` | 整案预演（只读，返回处理前后对比与签名 token；409 过期 / 400 整案无效） |
 | POST | `/api/appeals/confirm` | 整案确认（expectedRevision + token；原子落库只推进一次修订，409 需重新预演） |
-| GET | `/api/results` | 当前实时成绩排名 |
-| POST | `/api/publications` | 发布冻结快照（需 `expectedRevision`） |
-| GET | `/api/publications` / `/api/publications/:version` | 版本列表 / 历史冻结版详情 |
+| GET | `/api/results` | 当前实时成绩排名（含 `elapsed` 原始耗时与 `netElapsed` 净耗时） |
+| POST | `/api/publications` | 发布冻结快照（含停表区间与净耗时，需 `expectedRevision`） |
+| GET | `/api/publications` / `/api/publications/:version` | 版本列表 / 历史冻结版详情（含 `stoppages`） |
 
 ## 目录结构
 
 ```
 server/            Express + better-sqlite3 后端
-  src/index.mjs    API 路由（含整案申诉 /api/appeals/preview|confirm）
+  src/index.mjs    API 路由（含整案申诉 /api/appeals/preview|confirm、停表区间 /api/stoppages）
   src/appeals.mjs  整案操作校验、只读内存预演、签名令牌与原子提交
-  src/scoring.mjs  最早有效链与排名算法（支持内存读数核算）
-  src/db.mjs       SQLite 连接/建表/修订号
-  src/seed.mjs     演示数据
-  src/schema.sql   数据库表结构
-  e2e-test.mjs     端到端断言（97 项，覆盖核算/整批拒绝/修订锁/冻结/重导语义/整案申诉两阶段）
+  src/scoring.mjs  最早有效链、区间并集/交长、净耗时与排名算法（支持内存读数核算）
+  src/db.mjs       SQLite 连接/建表/修订号/旧库迁移（停表列回填）
+  src/seed.mjs     演示数据（含一段天气停表区间 500–600s）
+  src/schema.sql   数据库表结构（stoppage_interval、publication.stoppages_json、published_result.net_elapsed）
+  e2e-test.mjs     端到端断言（122 项，覆盖核算/整批拒绝/修订锁/冻结/重导语义/整案申诉/停表净耗时）
 web/               React + Vite 前端
-  src/components/  六个功能页面（成绩/整案申诉/单条复核/导入/设置/发布）
+  src/components/  七个功能页面（成绩/停表区间/整案申诉/单条复核/导入/设置/发布）
 Dockerfile         多阶段构建（前端构建 + 后端 + 运行镜像）
 docker-compose.yml 一键启动、建表、初始化数据，端口 3000
 ```
@@ -327,6 +396,6 @@ docker-compose.yml 一键启动、建表、初始化数据，端口 3000
 rm -f data/orienteering.db*
 SEED=1 node server/src/index.mjs
 
-# 终端 2：运行 97 项断言（含整案申诉预演/确认与更正作废后重导语义）
+# 终端 2：运行 122 项断言（含整案申诉预演/确认、停表净耗时、冻结版不可变）
 node server/e2e-test.mjs http://localhost:3000
 ```

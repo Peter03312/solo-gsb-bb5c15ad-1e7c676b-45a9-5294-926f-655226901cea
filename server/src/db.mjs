@@ -21,6 +21,26 @@ export function initDb(db = getDb()) {
   const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf8');
   db.exec(schema);
   migratePunchOriginals(db);
+  migrateStopwatch(db);
+}
+
+/**
+ * 旧库迁移：停表功能新增列/表。
+ * - stoppage_interval 为新表，CREATE TABLE IF NOT EXISTS 已自动建立；
+ * - publication 增加 stoppages_json（旧发布版冻结当时无停表配置，回填 '[]'）；
+ * - published_result 增加 net_elapsed（旧版净耗时即原始耗时，回填 elapsed）。
+ * 幂等：列已存在时跳过。
+ */
+function migrateStopwatch(db) {
+  const pubCols = db.prepare('PRAGMA table_info(publication)').all().map((c) => c.name);
+  if (!pubCols.includes('stoppages_json'))
+    db.exec("ALTER TABLE publication ADD COLUMN stoppages_json TEXT NOT NULL DEFAULT '[]'");
+  const resCols = db.prepare('PRAGMA table_info(published_result)').all().map((c) => c.name);
+  if (!resCols.includes('net_elapsed')) {
+    db.exec('ALTER TABLE published_result ADD COLUMN net_elapsed INTEGER');
+    // 旧发布版发布时尚无停表区间：净耗时 = 原始耗时（未完赛者两列均为 NULL）
+    db.prepare('UPDATE published_result SET net_elapsed = elapsed WHERE net_elapsed IS NULL AND elapsed IS NOT NULL').run();
+  }
 }
 
 /**

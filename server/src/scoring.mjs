@@ -2,7 +2,7 @@
 // 的最早有效链（贪心：每组取时间允许范围内最早的一条有效打卡）。
 // 逆序打卡、多余打卡不作完成依据。
 
-/** 读取当前赛事配置 */
+/** 读取当前赛事配置（含停表区间，已合并为不交并集） */
 export function loadConfig(db) {
   const ev = db.prepare('SELECT * FROM event WHERE id = 1').get();
   if (!ev) return null;
@@ -15,12 +15,44 @@ export function loadConfig(db) {
       .all(g.id)
       .map((r) => r.point);
   }
-  return { ...ev, groups };
+  const stoppages = mergeIntervals(
+    db.prepare('SELECT start_secs AS start, end_secs AS end FROM stoppage_interval').all()
+  );
+  return { ...ev, groups, stoppages };
+}
+
+/**
+ * 区间并集：把 [start,end)（半开，秒为整数所以与闭区间等长）合并为不交且按起点升序的数组。
+ * 相邻（a.end === b.start）也合并；输入须先通过 start>=0、start<end 的校验。
+ */
+export function mergeIntervals(raw) {
+  const ivs = (raw || [])
+    .map((x) => ({ start: Number(x.start), end: Number(x.end) }))
+    .sort((a, b) => (a.start !== b.start ? a.start - b.start : a.end - b.end));
+  const out = [];
+  for (const iv of ivs) {
+    const last = out[out.length - 1];
+    if (last && iv.start <= last.end) last.end = Math.max(last.end, iv.end);
+    else out.push({ start: iv.start, end: iv.end });
+  }
+  return out;
+}
+
+/** 并集区间与 [lo,hi) 的交长（整数秒数；lo>=hi 时为 0）。 */
+export function overlapLength(intervals, lo, hi) {
+  if (hi <= lo) return 0;
+  let len = 0;
+  for (const iv of intervals) {
+    const s = Math.max(iv.start, lo);
+    const e = Math.min(iv.end, hi);
+    if (e > s) len += e - s;
+  }
+  return len;
 }
 
 /**
  * 计算所有选手成绩。
- * 返回按耗时排序的结果数组（无有效链排后），同耗时并列。
+ * 返回按净耗时排序的结果数组（无有效链排后），同净耗时并列。
  */
 export function computeResults(db, config = loadConfig(db)) {
   if (!config) return [];
@@ -37,23 +69,27 @@ export function computeResults(db, config = loadConfig(db)) {
   return rankResults(results);
 }
 
-/** 全局排名：完成者按耗时升序（含并列），无有效链不排名。可用于内存中的预演结果。 */
+/** 全局排名：完成者按净耗时升序（含并列），无有效链不排名。可用于内存中的预演结果。 */
 export function rankResults(results) {
+  const netOf = (r) => (r.netElapsed != null ? r.netElapsed : r.elapsed);
   results.sort((a, b) => {
     if (a.elapsed == null && b.elapsed == null) return a.bib.localeCompare(b.bib);
     if (a.elapsed == null) return 1;
     if (b.elapsed == null) return -1;
-    if (a.elapsed !== b.elapsed) return a.elapsed - b.elapsed;
+    const na = netOf(a);
+    const nb = netOf(b);
+    if (na !== nb) return na - nb;
     return a.bib.localeCompare(b.bib);
   });
-  // 并列名次
+  // 并列名次（按净耗时）
   let rank = 0;
-  let prevElapsed = null;
+  let prevNet = null;
   results.forEach((r, i) => {
     if (r.elapsed != null) {
-      if (r.elapsed !== prevElapsed) rank = i + 1;
+      const n = netOf(r);
+      if (n !== prevNet) rank = i + 1;
       r.rank = rank;
-      prevElapsed = r.elapsed;
+      prevNet = n;
     }
   });
   return results;
@@ -78,7 +114,13 @@ export function computeRunner(db, config, bib, name = null) {
  * 计算最早有效链、失败原因与耗时。readings 形如 { record_no, point, seconds, kind }。
  */
 export function computeRunnerFromReadings(readings, config, bib, name = null) {
-  const base = { bib, name, status: 'ok', elapsed: null, failAt: null, detail: '', chain: [] };
+  const base = {
+    bib, name, status: 'ok',
+    elapsed: null, // 原始耗时（终点 − 出发秒数），语义不变
+    netElapsed: null, // 净耗时 = 原始耗时 − 停表区间并集与[出发,终点]的交长；未完赛者无
+    stoppedSecs: null, // 该选手中被扣减的停表秒数
+    failAt: null, detail: '', chain: [],
+  };
   // 保证按 seconds、记录次序严格递增处理（调用方通常已排序，这里再排一次以免预演漏排）
   const punches = [...readings].sort((a, b) =>
     a.seconds !== b.seconds ? a.seconds - b.seconds : String(a.record_no).localeCompare(String(b.record_no))
@@ -135,7 +177,11 @@ export function computeRunnerFromReadings(readings, config, bib, name = null) {
     return { ...base, status: 'finish_dnf', failAt: '终点', detail, chain };
   }
   chain.push(slim(finish));
-  return { ...base, elapsed: finish.seconds - start.seconds, chain };
+  // 原始耗时语义不变；关卡/终点截止与有效链均按原始秒数判定（见上方循环）。
+  // 净耗时：仅扣减停表区间并集与「出发→终点」区间的交长；重叠区间只计一次。
+  const elapsed = finish.seconds - start.seconds;
+  const stoppedSecs = overlapLength(config.stoppages || [], start.seconds, finish.seconds);
+  return { ...base, elapsed, stoppedSecs, netElapsed: elapsed - stoppedSecs, chain };
 }
 
 function slim(p) {

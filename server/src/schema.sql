@@ -25,6 +25,16 @@ CREATE TABLE IF NOT EXISTS group_point (
   PRIMARY KEY (group_id, point)
 );
 
+-- 统一停表区间（天气等原因赛事统一停表；距发枪秒数，左闭右开，[start,end)）
+-- 全赛事单例集合：整体替换维护；重叠区间在核算时按并集只计一次。
+CREATE TABLE IF NOT EXISTS stoppage_interval (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  start_secs INTEGER NOT NULL CHECK (start_secs >= 0),
+  end_secs   INTEGER NOT NULL CHECK (end_secs >= 0),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  CHECK (start_secs < end_secs)
+);
+
 CREATE TABLE IF NOT EXISTS runner (
   bib  TEXT PRIMARY KEY,
   name TEXT
@@ -65,27 +75,30 @@ CREATE TABLE IF NOT EXISTS punch_audit (
   at           TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- 发布快照（冻结，不可变）
+-- 发布快照（冻结，不可变）：同时冻结发布当时的停表区间
 CREATE TABLE IF NOT EXISTS publication (
-  version        INTEGER PRIMARY KEY,
-  event_revision INTEGER NOT NULL,
-  published_at   TEXT NOT NULL DEFAULT (datetime('now')),
-  note           TEXT,
-  config_json    TEXT NOT NULL,
-  readings_json  TEXT NOT NULL,
-  results_json   TEXT NOT NULL
+  version         INTEGER PRIMARY KEY,
+  event_revision  INTEGER NOT NULL,
+  published_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  note            TEXT,
+  config_json     TEXT NOT NULL,
+  stoppages_json  TEXT NOT NULL DEFAULT '[]',
+  readings_json   TEXT NOT NULL,
+  results_json    TEXT NOT NULL
 );
 
 -- 发布版成绩（便于排名查询），历史版永不被后续更正修改
+-- elapsed=原始耗时；net_elapsed=发布当时按冻结停表区间算出的净耗时（未完赛为 NULL）
 CREATE TABLE IF NOT EXISTS published_result (
   publication_version INTEGER NOT NULL REFERENCES publication(version),
-  bib      TEXT NOT NULL,
-  name     TEXT,
-  status   TEXT NOT NULL,
-  elapsed  INTEGER,
-  fail_at  TEXT,
-  detail   TEXT,
-  rank_no  INTEGER,
+  bib         TEXT NOT NULL,
+  name        TEXT,
+  status      TEXT NOT NULL,
+  elapsed     INTEGER,
+  net_elapsed INTEGER,
+  fail_at     TEXT,
+  detail      TEXT,
+  rank_no     INTEGER,
   PRIMARY KEY (publication_version, bib)
 );
 
