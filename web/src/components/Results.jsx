@@ -37,10 +37,18 @@ export default function Results() {
         起点 <b>{data.startPoint}</b> · 终点 <b>{data.finishPoint}</b> · 终点截止{' '}
         <b>{data.finishCutoff}s（{fmtTime(data.finishCutoff)}）</b> · 实时修订 #{data.revision}
       </p>
+      {(data.mergedStoppages || []).length > 0 && (
+        <p className="muted small">
+          ⏱ 统一停表并集（重叠只计一次）：
+          {data.mergedStoppages.map(iv => `[${iv.start}, ${iv.end})`).join('、')}
+          {' '}— 完成者净耗时已扣除与各人「出发→终点」区间的交长；关卡/终点截止仍按原始秒数判定。
+        </p>
+      )}
       <table className="grid">
         <thead>
           <tr>
-            <th>名次</th><th>号码布</th><th>姓名</th><th>状态</th><th>耗时</th>
+            <th>名次</th><th>号码布</th><th>姓名</th><th>状态</th>
+            <th>原始耗时</th><th>净耗时</th><th>停表扣除</th>
             <th>首个未完成 / 说明</th><th className="chain-col">最早有效链</th>
           </tr>
         </thead>
@@ -54,6 +62,8 @@ export default function Results() {
                 <td>{r.name || '—'}</td>
                 <td><span className={`badge ${st.cls}`}>{st.text}</span></td>
                 <td>{r.elapsed != null ? `${fmtTime(r.elapsed)}（${r.elapsed}s）` : '—'}</td>
+                <td>{r.netElapsed != null ? <b>{`${fmtTime(r.netElapsed)}（${r.netElapsed}s）`}</b> : '—'}</td>
+                <td>{r.status === 'ok' ? `${r.stoppedSecs ?? 0}s` : '—'}</td>
                 <td>{r.failAt ? <><b>{r.failAt}</b>：{r.detail}</> : r.detail || '—'}</td>
                 <td className="chain">
                   {r.chain.map((c, i) => (
@@ -72,7 +82,9 @@ export default function Results() {
       </table>
       <p className="muted small">
         规则：打卡时间相对发枪秒数须严格递增，按关卡组顺序每组在可替代点位中选最早一条；
-        逆序及多余打卡不作完成依据。同耗时并列同名次。
+        逆序及多余打卡不作完成依据。关卡/终点截止与有效链按<b>原始秒数</b>判定。
+        完成者排名按<b>净耗时</b>（原始耗时扣除停表并集与出发→终点区间的交长），同净耗时并列同名次；
+        原始耗时列保持原始终点−出发秒数不变，未完赛者无净耗时。
       </p>
     </div>
   );

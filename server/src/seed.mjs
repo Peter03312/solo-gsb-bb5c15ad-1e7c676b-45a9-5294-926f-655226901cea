@@ -56,7 +56,11 @@ export function seedDemo(db) {
     ];
     const tx = db.transaction(() => {
       for (const r of rows) insP.run(r[0], r[1], r[2], r[3], r[4], r[1], r[2], r[3], r[4]);
-      // 关卡初始为修订 #1，演示读数导入后推进
+      // 统一停表（天气）：两段登记区间在 400~600 重叠，按并集 [400,600) 只计 200s
+      const insStop = db.prepare('INSERT INTO stoppage_interval (start_secs, end_secs) VALUES (?, ?)');
+      insStop.run(400, 550);
+      insStop.run(500, 600);
+      // 关卡初始为修订 #1，演示读数/停表导入后推进
       bumpRevision(db);
       db.prepare('INSERT INTO meta (k, v) VALUES (?, ?)').run('seeded', '1');
     });

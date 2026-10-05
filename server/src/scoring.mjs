@@ -2,7 +2,41 @@
 // 的最早有效链（贪心：每组取时间允许范围内最早的一条有效打卡）。
 // 逆序打卡、多余打卡不作完成依据。
 
-/** 读取当前赛事配置 */
+/**
+ * 合并停表区间为互不相交的并集（半开区间 [start, end)，相邻端点相接也合并）。
+ * 输入形如 {start_secs, end_secs}（或 {startSecs, endSecs}），按起点排序后贪心合并。
+ * 重叠区间只计一次。
+ */
+export function mergeIntervals(intervals) {
+  const norm = (intervals || [])
+    .map((iv) => ({
+      start: Number(iv.start_secs ?? iv.startSecs),
+      end: Number(iv.end_secs ?? iv.endSecs),
+    }))
+    .filter((iv) => Number.isInteger(iv.start) && Number.isInteger(iv.end) && iv.start >= 0 && iv.end > iv.start)
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+  const merged = [];
+  for (const iv of norm) {
+    const last = merged[merged.length - 1];
+    if (last && iv.start <= last.end) last.end = Math.max(last.end, iv.end);
+    else merged.push({ ...iv });
+  }
+  return merged;
+}
+
+/** 已合并区间并集与区间 [lo, hi]（半开）的交长；不相交/退化区间为 0。 */
+export function intersectLength(merged, lo, hi) {
+  if (!(hi > lo)) return 0;
+  let total = 0;
+  for (const iv of merged) {
+    const a = Math.max(iv.start, lo);
+    const b = Math.min(iv.end, hi);
+    if (b > a) total += b - a;
+  }
+  return total;
+}
+
+/** 读取当前赛事配置（含停表区间原始登记与其并集） */
 export function loadConfig(db) {
   const ev = db.prepare('SELECT * FROM event WHERE id = 1').get();
   if (!ev) return null;
@@ -15,7 +49,11 @@ export function loadConfig(db) {
       .all(g.id)
       .map((r) => r.point);
   }
-  return { ...ev, groups };
+  const stoppages = db
+    .prepare('SELECT start_secs, end_secs FROM stoppage_interval ORDER BY id')
+    .all()
+    .map((r) => ({ startSecs: r.start_secs, endSecs: r.end_secs }));
+  return { ...ev, groups, stoppages, mergedStoppages: mergeIntervals(stoppages) };
 }
 
 /**
@@ -37,23 +75,27 @@ export function computeResults(db, config = loadConfig(db)) {
   return rankResults(results);
 }
 
-/** 全局排名：完成者按耗时升序（含并列），无有效链不排名。可用于内存中的预演结果。 */
+/**
+ * 全局排名：完成者按净耗时升序（同净耗时并列），无有效链不排名。
+ * 净耗时 = 原始耗时 − 停表区间并集与[出发秒数, 终点秒数]的交长。
+ * 可用于内存中的预演结果。
+ */
 export function rankResults(results) {
   results.sort((a, b) => {
-    if (a.elapsed == null && b.elapsed == null) return a.bib.localeCompare(b.bib);
-    if (a.elapsed == null) return 1;
-    if (b.elapsed == null) return -1;
-    if (a.elapsed !== b.elapsed) return a.elapsed - b.elapsed;
+    if (a.netElapsed == null && b.netElapsed == null) return a.bib.localeCompare(b.bib);
+    if (a.netElapsed == null) return 1;
+    if (b.netElapsed == null) return -1;
+    if (a.netElapsed !== b.netElapsed) return a.netElapsed - b.netElapsed;
     return a.bib.localeCompare(b.bib);
   });
-  // 并列名次
+  // 并列名次（按净耗时）
   let rank = 0;
-  let prevElapsed = null;
+  let prevNet = null;
   results.forEach((r, i) => {
-    if (r.elapsed != null) {
-      if (r.elapsed !== prevElapsed) rank = i + 1;
+    if (r.netElapsed != null) {
+      if (r.netElapsed !== prevNet) rank = i + 1;
       r.rank = rank;
-      prevElapsed = r.elapsed;
+      prevNet = r.netElapsed;
     }
   });
   return results;
@@ -75,10 +117,12 @@ export function computeRunner(db, config, bib, name = null) {
 
 /**
  * 纯函数版核算：给定某选手的有效读数数组（内存预演可用虚拟读数），
- * 计算最早有效链、失败原因与耗时。readings 形如 { record_no, point, seconds, kind }。
+ * 计算最早有效链、失败原因、原始耗时与净耗时。readings 形如 { record_no, point, seconds, kind }。
+ * 关卡组截止/终点截止与有效链仍一律按「原始距发枪秒数」判定；
+ * 净耗时仅用于完成者的排名：原始耗时 − 停表区间并集 ∩ [出发秒数, 终点秒数] 的长度。
  */
 export function computeRunnerFromReadings(readings, config, bib, name = null) {
-  const base = { bib, name, status: 'ok', elapsed: null, failAt: null, detail: '', chain: [] };
+  const base = { bib, name, status: 'ok', elapsed: null, netElapsed: null, stoppedSecs: 0, failAt: null, detail: '', chain: [] };
   // 保证按 seconds、记录次序严格递增处理（调用方通常已排序，这里再排一次以免预演漏排）
   const punches = [...readings].sort((a, b) =>
     a.seconds !== b.seconds ? a.seconds - b.seconds : String(a.record_no).localeCompare(String(b.record_no))
@@ -135,7 +179,11 @@ export function computeRunnerFromReadings(readings, config, bib, name = null) {
     return { ...base, status: 'finish_dnf', failAt: '终点', detail, chain };
   }
   chain.push(slim(finish));
-  return { ...base, elapsed: finish.seconds - start.seconds, chain };
+  const elapsed = finish.seconds - start.seconds;
+  // 停表并集与「出发至终点」区间的交长（出发/终点秒数均为原始秒数，晚出发者不摊到赛前停表）
+  const merged = config.mergedStoppages ?? mergeIntervals(config.stoppages ?? []);
+  const stoppedSecs = intersectLength(merged, start.seconds, finish.seconds);
+  return { ...base, elapsed, netElapsed: elapsed - stoppedSecs, stoppedSecs, chain };
 }
 
 function slim(p) {

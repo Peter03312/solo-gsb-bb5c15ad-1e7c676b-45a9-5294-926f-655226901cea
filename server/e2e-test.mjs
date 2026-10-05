@@ -401,5 +401,186 @@ console.log('9) 整案后历史发布版仍冻结');
     snap1.readings.find(x => x.record_no === 'R0003').seconds === 300);
 }
 
+console.log('10) 统一停表：区间维护、净耗时排名、修订锁与发布冻结');
+{
+  // 10.1 种子停表区间随 /api/event、/api/results、/api/stoppages 返回（两段重叠 => 并集 [400,600)）
+  const ev = (await call('/api/event')).body;
+  ok('10.1 /api/event 返回登记停表两段',
+    JSON.stringify(ev.stoppages) === JSON.stringify([
+      { startSecs: 400, endSecs: 550 }, { startSecs: 500, endSecs: 600 },
+    ]));
+  ok('10.1 重叠区间合并为 [400,600)', JSON.stringify(ev.mergedStoppages) === JSON.stringify([{ start: 400, end: 600 }]));
+  const sg = (await call('/api/stoppages')).body;
+  ok('10.1 GET /api/stoppages 返回登记与并集',
+    sg.configured && sg.stoppages.length === 2 && JSON.stringify(sg.mergedStoppages) === JSON.stringify([{ start: 400, end: 600 }]));
+  const rs0 = await resultsByBib();
+  ok('10.1 001 原始 910、净 710、扣除 200',
+    rs0.get('001').elapsed === 910 && rs0.get('001').netElapsed === 710 && rs0.get('001').stoppedSecs === 200);
+  ok('10.1 004/006 原始同 1000、净同 800 并列同名次',
+    rs0.get('004').elapsed === 1000 && rs0.get('006').elapsed === 1000 &&
+    rs0.get('004').netElapsed === 800 && rs0.get('006').netElapsed === 800 &&
+    rs0.get('004').rank === rs0.get('006').rank);
+  ok('10.1 未完赛者无净耗时（002 netElapsed=null）', rs0.get('002').netElapsed == null);
+
+  // 10.2 校验：无效区间整次拒绝；修订锁
+  const r0 = await rev();
+  const negStart = await call('/api/stoppages', { method: 'POST', body: JSON.stringify({
+    expectedRevision: r0, intervals: [{ startSecs: -1, endSecs: 10 }],
+  })});
+  ok('10.2 负起点 400 整次拒绝', negStart.status === 400 && /非负整数/.test(negStart.body.error));
+  const reversed = await call('/api/stoppages', { method: 'POST', body: JSON.stringify({
+    expectedRevision: r0, intervals: [{ startSecs: 100, endSecs: 100 }],
+  })});
+  ok('10.2 起点不小于终点 400 整次拒绝', reversed.status === 400 && /起点须小于终点/.test(reversed.body.error));
+  const badType = await call('/api/stoppages', { method: 'POST', body: JSON.stringify({
+    expectedRevision: r0, intervals: [{ startSecs: '0', endSecs: 10 }],
+  })});
+  ok('10.2 非整数 400 整次拒绝', badType.status === 400);
+  const noArr = await call('/api/stoppages', { method: 'POST', body: JSON.stringify({
+    expectedRevision: r0, intervals: { startSecs: 0, endSecs: 10 },
+  })});
+  ok('10.2 intervals 非数组 400', noArr.status === 400);
+  const stale = await call('/api/stoppages', { method: 'POST', body: JSON.stringify({
+    expectedRevision: r0 + 999, intervals: [],
+  })});
+  ok('10.2 过期修订 409 带 currentRevision', stale.status === 409 && stale.body.currentRevision === r0);
+  const noRev = await call('/api/stoppages', { method: 'POST', body: JSON.stringify({ intervals: [] })});
+  ok('10.2 缺 expectedRevision 400', noRev.status === 400);
+  ok('10.2 整次拒绝后停表/修订不变', (await rev()) === r0 &&
+    JSON.stringify((await call('/api/stoppages')).body.mergedStoppages) === JSON.stringify([{ start: 400, end: 600 }]));
+
+  // 10.3 净耗时排名：换成自定义区间，导入两名原始耗时不同、净耗时相同的选手验证并列
+  const set1 = await call('/api/stoppages', { method: 'POST', body: JSON.stringify({
+    expectedRevision: r0, intervals: [{ startSecs: 100, endSecs: 300 }, { startSecs: 200, endSecs: 400 }],
+  })});
+  ok('10.3 替换停表成功并推进修订（两段重叠=>并集[100,400) 300s）',
+    set1.status === 200 && set1.body.changed &&
+    JSON.stringify(set1.body.mergedStoppages) === JSON.stringify([{ start: 100, end: 400 }]) &&
+    set1.body.revision === r0 + 1);
+  const r1 = await rev();
+  // 101: S@0 A@50 B@450 F@600 => 原始600，扣除[100,400)=300，净300
+  // 102: S@0 A@50 B@550 F@700 => 原始700，扣除[100,400)=300，净400 ...
+  // 为构造不同原始、相同净耗时：101 扣 300（停表全在其赛段），102 用更晚出发/终点使扣除相同
+  // 采用晚出发选手：102 S@100 A@350(=250链? 注意严格递增且组截止600) ...
+  const imp = await call('/api/punches/import', { method: 'POST', body: JSON.stringify({ expectedRevision: r1, punches: [
+    { recordNo: 'T1011', bib: '101', name: '净时甲', point: 'S', seconds: 0, kind: 'start' },
+    { recordNo: 'T1012', bib: '101', point: 'A1', seconds: 50, kind: 'enroute' },
+    { recordNo: 'T1013', bib: '101', point: 'B1', seconds: 450, kind: 'enroute' },
+    { recordNo: 'T1014', bib: '101', point: 'F', seconds: 600, kind: 'finish' },
+    // 102 晚出发：S@100，停表并集与 [100,700) 交长仍 300；原始 600 与 101 相同。
+    // 改为终点 700（原始 600，扣 300）不区分；用 S@200 => 原始 500，扣 [200,400)=200，净 300
+    { recordNo: 'T1021', bib: '102', name: '净时乙', point: 'S', seconds: 200, kind: 'start' },
+    { recordNo: 'T1022', bib: '102', point: 'A1', seconds: 420, kind: 'enroute' },
+    { recordNo: 'T1023', bib: '102', point: 'B1', seconds: 550, kind: 'enroute' },
+    { recordNo: 'T1024', bib: '102', point: 'F', seconds: 700, kind: 'finish' },
+  ]})});
+  ok('10.3 两名净时选手导入成功（8 条）', imp.status === 200 && imp.body.inserted === 8);
+  const rs1 = await resultsByBib();
+  ok('10.3 101 原始 600 扣 300 净 300',
+    rs1.get('101').elapsed === 600 && rs1.get('101').stoppedSecs === 300 && rs1.get('101').netElapsed === 300);
+  ok('10.3 102 晚出发原始 500 仅扣赛段内停表 200、净 300',
+    rs1.get('102').elapsed === 500 && rs1.get('102').stoppedSecs === 200 && rs1.get('102').netElapsed === 300);
+  ok('10.3 不同原始耗时（600 vs 500）同净耗时 300 => 并列同名次',
+    rs1.get('101').rank === rs1.get('102').rank);
+  ok('10.3 净 300 选手领先于种子 001（并集更换后 001 交 [100,400)∩[0,910)=300，净 610）',
+    rs1.get('101').rank < rs1.get('001').rank && rs1.get('001').netElapsed === 610);
+
+  // 10.4 关卡/终点截止仍按原始秒数：净耗时再小，终点晚于截止仍未完赛
+  const r2 = await rev();
+  const impLate = await call('/api/punches/import', { method: 'POST', body: JSON.stringify({ expectedRevision: r2, punches: [
+    { recordNo: 'T1031', bib: '103', name: '超时丙', point: 'S', seconds: 0, kind: 'start' },
+    { recordNo: 'T1032', bib: '103', point: 'A1', seconds: 200, kind: 'enroute' },
+    { recordNo: 'T1033', bib: '103', point: 'B1', seconds: 900, kind: 'enroute' },
+    // 终点 1900 > 截止 1800；即便 [100,400) 扣 300 净=1600 < 1800，仍判终点超时
+    { recordNo: 'T1034', bib: '103', point: 'F', seconds: 1900, kind: 'finish' },
+  ]})});
+  ok('10.4 导入超时选手成功', impLate.status === 200);
+  const rs2 = await resultsByBib();
+  ok('10.4 终点 1900 超原始截止 1800：finish_dnf 且无净耗时',
+    rs2.get('103').status === 'finish_dnf' && rs2.get('103').netElapsed == null && /1900/.test(rs2.get('103').detail));
+
+  // 10.5 幂等：提交与当前并集完全一致的集合不推进修订；改变才推进
+  const r3 = await rev();
+  const sameSet = await call('/api/stoppages', { method: 'POST', body: JSON.stringify({
+    expectedRevision: r3,
+    intervals: [{ startSecs: 200, endSecs: 400 }, { startSecs: 100, endSecs: 300 }, { startSecs: 250, endSecs: 260 }],
+  })});
+  ok('10.5 不同登记但同一并集 => changed:false 且修订不变',
+    sameSet.status === 200 && sameSet.body.changed === false && sameSet.body.revision === r3);
+  ok('10.5 幂等请求不改变登记（GET 仍返回原两段）',
+    (await call('/api/stoppages')).body.stoppages.length === 2);
+  const emptySet = await call('/api/stoppages', { method: 'POST', body: JSON.stringify({
+    expectedRevision: r3, intervals: [],
+  })});
+  ok('10.5 清空停表成功并推进修订',
+    emptySet.status === 200 && emptySet.body.changed && emptySet.body.revision === r3 + 1 &&
+    emptySet.body.mergedStoppages.length === 0);
+  const rs3 = await resultsByBib();
+  ok('10.5 清空后净耗时=原始耗时（101 净 600）',
+    rs3.get('101').netElapsed === 600 && rs3.get('101').stoppedSecs === 0);
+
+  // 10.6 整案预演/确认排名遵循同一净耗时规则：重设停表后预演一条更正，前后名次按净时变化
+  const r4 = await rev();
+  const putBack = await call('/api/stoppages', { method: 'POST', body: JSON.stringify({
+    expectedRevision: r4, intervals: [{ startSecs: 0, endSecs: 100 }],
+  })});
+  ok('10.6 重设停表 [0,100) 成功', putBack.status === 200 && putBack.body.revision === r4 + 1);
+  const r5 = await rev();
+  // 103 当前 finish_dnf；整案把 F@1900 更正为 F@950 => 原始 950，扣除[0,100)∩[0,950)=100，净 850
+  const id1034 = (await call('/api/punches?bib=103')).body.punches.find(x => x.record_no === 'T1034').id;
+  const pv = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({
+    expectedRevision: r5,
+    operations: [
+      { punchId: id1034, action: 'correct', reason: '停表轮：终点读数笔误', newPoint: 'F', newSeconds: 950 },
+    ],
+  })});
+  ok('10.6 预演成功', pv.status === 200);
+  const a103 = pv.body.affected.find(x => x.bib === '103');
+  ok('10.6 预演 103 完成：原始 950、净 850、扣 100',
+    a103.after.status === 'ok' && a103.after.elapsed === 950 &&
+    a103.after.netElapsed === 850 && a103.after.stoppedSecs === 100);
+  const cf = await call('/api/appeals/confirm', { method: 'POST', body: JSON.stringify({
+    expectedRevision: r5, token: pv.body.token,
+  })});
+  ok('10.6 确认成功并返回净耗时字段',
+    cf.status === 200 && cf.body.results.some(x => x.bib === '103' && x.netElapsed === 850 && x.elapsed === 950));
+
+  // 10.7 发布冻结当时停表与净耗时，后续调整不改历史版
+  const r6 = await rev();
+  const beforePub = await resultsByBib();
+  const net103AtPub = beforePub.get('103').netElapsed;
+  const pub = await call('/api/publications', { method: 'POST', body: JSON.stringify({
+    expectedRevision: r6, note: '停表轮冻结版',
+  })});
+  ok('10.7 发布新版本成功', pub.status === 200);
+  const pubVersion = pub.body.version;
+  const snap = (await call(`/api/publications/${pubVersion}`)).body;
+  ok('10.7 冻结配置含停表并集 [0,100)',
+    JSON.stringify(snap.config.mergedStoppages) === JSON.stringify([{ start: 0, end: 100 }]) &&
+    JSON.stringify(snap.config.stoppages) === JSON.stringify([{ startSecs: 0, endSecs: 100 }]));
+  const s103 = snap.results.find(x => x.bib === '103');
+  ok('10.7 冻结成绩含净耗时 850 与原始 950',
+    s103.elapsed === 950 && s103.netElapsed === net103AtPub && s103.netElapsed === 850);
+
+  // 发布后清空停表：历史版不变
+  const r7 = await rev();
+  const clear = await call('/api/stoppages', { method: 'POST', body: JSON.stringify({
+    expectedRevision: r7, intervals: [],
+  })});
+  ok('10.7 发布后清空停表推进修订', clear.status === 200);
+  const snapAfter = (await call(`/api/publications/${pubVersion}`)).body;
+  ok('10.7 历史版停表区间仍冻结 [0,100)',
+    JSON.stringify(snapAfter.config.mergedStoppages) === JSON.stringify([{ start: 0, end: 100 }]));
+  ok('10.7 历史版净耗时仍 850（实时已回到 950）',
+    snapAfter.results.find(x => x.bib === '103').netElapsed === 850 &&
+    (await resultsByBib()).get('103').netElapsed === 950);
+  // 早期发布版（停表功能前的演示库不适用；本轮 v1 已在含种子停表 [400,600) 时发布）
+  const snapV1 = (await call('/api/publications/1')).body;
+  ok('10.7 v1 冻结的是当时种子停表 [400,600)',
+    JSON.stringify(snapV1.config.mergedStoppages) === JSON.stringify([{ start: 400, end: 600 }]));
+  ok('10.7 v1 001 冻结净耗时 710',
+    snapV1.results.find(x => x.bib === '001').netElapsed === 710);
+}
+
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
 process.exit(fail ? 1 : 0);

@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getDb, initDb, bumpRevision, currentRevision } from './db.mjs';
-import { loadConfig, computeResults } from './scoring.mjs';
+import { loadConfig, computeResults, mergeIntervals } from './scoring.mjs';
 import {
   validateOperations, canonicalOps, signPreview, verifyPreview,
   previewCase, commitCase,
@@ -58,7 +58,62 @@ app.get('/api/event', (req, res) => {
       cutoffSecs: g.cutoff_secs,
       points: g.points,
     })),
+    // 停表区间：原始登记（可重叠）与去重合并后的并集，均以距发枪秒数 [start,end) 表示
+    stoppages: cfg.stoppages,
+    mergedStoppages: cfg.mergedStoppages,
   });
+});
+
+// ---------- 统一停表区间 ----------
+/**
+ * POST /api/stoppages
+ * body: { expectedRevision, intervals: [{ startSecs, endSecs }] }
+ * 整体替换登记停表区间（重叠区间合法，核算按并集只计一次）。
+ * 每个区间起止均为非负整数且起点 < 终点，任一非法则整次拒绝（不写库、不推进修订）。
+ * 与现有集合（按并集规范化后）完全相同 => 幂等，只读不推进修订。
+ */
+app.post('/api/stoppages', (req, res) => {
+  if (!checkRevision(req, res)) return;
+  if (!loadConfig(db)) return badRequest(res, '赛事尚未配置，请先设置关卡组');
+  const { intervals } = req.body || {};
+  if (!Array.isArray(intervals)) return badRequest(res, 'intervals 须为数组（清空停表请传空数组）');
+  const norm = [];
+  for (let i = 0; i < intervals.length; i++) {
+    const iv = intervals[i];
+    const where = `第 ${i + 1} 个区间`;
+    if (!iv || typeof iv !== 'object') return badRequest(res, `${where} 格式非法，整次拒绝`);
+    const startSecs = iv.startSecs;
+    const endSecs = iv.endSecs;
+    if (!Number.isInteger(startSecs) || startSecs < 0)
+      return badRequest(res, `${where}：起点须为非负整数，整次拒绝`);
+    if (!Number.isInteger(endSecs) || endSecs < 0)
+      return badRequest(res, `${where}：终点须为非负整数，整次拒绝`);
+    if (!(startSecs < endSecs))
+      return badRequest(res, `${where}：起点须小于终点，整次拒绝`);
+    norm.push({ startSecs, endSecs });
+  }
+
+  const merged = mergeIntervals(norm);
+  const existingMerged = mergeIntervals(loadConfig(db).stoppages);
+  const unchanged =
+    merged.length === existingMerged.length &&
+    merged.every((iv, i) => iv.start === existingMerged[i].start && iv.end === existingMerged[i].end);
+  // 与当前并集一致（含双方均为空）=> 幂等返回，不写库、不推进修订
+  if (unchanged) return res.json({ ok: true, revision: currentRevision(db), stoppages: norm, mergedStoppages: merged, changed: false });
+
+  const revision = db.transaction(() => {
+    db.prepare('DELETE FROM stoppage_interval').run();
+    const ins = db.prepare('INSERT INTO stoppage_interval (start_secs, end_secs) VALUES (?, ?)');
+    for (const iv of norm) ins.run(iv.startSecs, iv.endSecs);
+    return bumpRevision(db);
+  })();
+  res.json({ ok: true, revision, stoppages: norm, mergedStoppages: merged, changed: true });
+});
+
+app.get('/api/stoppages', (req, res) => {
+  const cfg = loadConfig(db);
+  if (!cfg) return res.json({ configured: false, revision: 0, stoppages: [], mergedStoppages: [] });
+  res.json({ configured: true, revision: cfg.revision, stoppages: cfg.stoppages, mergedStoppages: cfg.mergedStoppages });
 });
 
 /** 主办方设置/重设关卡组（整体替换；历史发布版已冻结配置，不受影响） */
@@ -225,6 +280,8 @@ app.get('/api/results', (req, res) => {
     finishPoint: cfg.finish_point,
     finishCutoff: cfg.finish_cutoff,
     groups: cfg.groups.map((g) => ({ name: g.name, seq: g.seq, cutoffSecs: g.cutoff_secs, points: g.points })),
+    stoppages: cfg.stoppages,
+    mergedStoppages: cfg.mergedStoppages,
     results,
   });
 });
@@ -373,6 +430,9 @@ app.post('/api/publications', (req, res) => {
       name: cfg.name, startPoint: cfg.start_point, finishPoint: cfg.finish_point,
       finishCutoff: cfg.finish_cutoff,
       groups: cfg.groups.map((g) => ({ seq: g.seq, name: g.name, cutoffSecs: g.cutoff_secs, points: g.points })),
+      // 冻结发布当时的停表区间登记及其并集；后续停表调整不改历史版
+      stoppages: cfg.stoppages,
+      mergedStoppages: cfg.mergedStoppages,
     });
     const readingsJson = JSON.stringify(readings);
     const resultsJson = JSON.stringify(results);
@@ -381,11 +441,11 @@ app.post('/api/publications', (req, res) => {
        VALUES (?, ?, ?, ?, ?, ?)`
     ).run(version, cfg.revision, note, configJson, readingsJson, resultsJson);
     const insR = db.prepare(
-      `INSERT INTO published_result (publication_version, bib, name, status, elapsed, fail_at, detail, rank_no)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO published_result (publication_version, bib, name, status, elapsed, net_elapsed, fail_at, detail, rank_no)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     for (const r of results)
-      insR.run(version, r.bib, r.name, r.status, r.elapsed, r.failAt ?? null, r.detail, r.rank ?? null);
+      insR.run(version, r.bib, r.name, r.status, r.elapsed, r.netElapsed ?? null, r.failAt ?? null, r.detail, r.rank ?? null);
     // 发布本身冻结快照；继续推进修订号，使旧页面的导入/发布请求走过期核对
     const rev = bumpRevision(db);
     return { version, rev };

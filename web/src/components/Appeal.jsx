@@ -32,7 +32,8 @@ function RankCell({ r }) {
     <div>
       <span className={`badge ${STATUS_CLS[r.status] || 'bad'}`}>{st}</span>
       <div className="small muted">名次 {r.rank ?? '—'}</div>
-      <div className="small">{r.elapsed != null ? `${r.elapsed}s（${fmtTime(r.elapsed)}）` : '—'}</div>
+      <div className="small">{r.netElapsed != null ? `${r.netElapsed}s 净（${fmtTime(r.netElapsed)}）` : '—'}</div>
+      <div className="small muted">{r.elapsed != null ? `原始 ${r.elapsed}s（${fmtTime(r.elapsed)}）` : '—'}</div>
     </div>
   );
 }
@@ -294,7 +295,7 @@ export default function Appeal({ event, onChanged, onError }) {
             {confirmResult.auditCount} 条变更及逐条审计已一次性写入（事务原子提交，无部分生效）；历史发布版保持冻结。
           </p>
           <table className="grid compact">
-            <thead><tr><th>名次</th><th>号码布</th><th>姓名</th><th>状态</th><th>耗时</th><th>说明</th></tr></thead>
+            <thead><tr><th>名次</th><th>号码布</th><th>姓名</th><th>状态</th><th>原始耗时</th><th>净耗时</th><th>说明</th></tr></thead>
             <tbody>
               {confirmResult.results.map(r => (
                 <tr key={r.bib} className={r.status === 'ok' ? '' : 'row-dnf'}>
@@ -303,6 +304,7 @@ export default function Appeal({ event, onChanged, onError }) {
                   <td>{r.name || '—'}</td>
                   <td><span className={`badge ${STATUS_CLS[r.status] || 'bad'}`}>{STATUS_LABEL[r.status] || r.status}</span></td>
                   <td>{r.elapsed != null ? `${r.elapsed}s（${fmtTime(r.elapsed)}）` : '—'}</td>
+                  <td>{r.netElapsed != null ? <b>{`${r.netElapsed}s（${fmtTime(r.netElapsed)}）`}</b> : '—'}</td>
                   <td className="small muted">{r.failAt ? `${r.failAt}：${r.detail}` : r.detail || '—'}</td>
                 </tr>
               ))}

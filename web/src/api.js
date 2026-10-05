@@ -36,4 +36,7 @@ export const api = {
     request('/api/appeals/preview', { method: 'POST', body: JSON.stringify(payload) }),
   appealConfirm: payload =>
     request('/api/appeals/confirm', { method: 'POST', body: JSON.stringify(payload) }),
+  stoppages: () => request('/api/stoppages'),
+  saveStoppages: payload =>
+    request('/api/stoppages', { method: 'POST', body: JSON.stringify(payload) }),
 };

@@ -25,6 +25,15 @@ CREATE TABLE IF NOT EXISTS group_point (
   PRIMARY KEY (group_id, point)
 );
 
+-- 统一停表区间（天气等原因赛事统一停表）：以「距发枪秒数」表示 [start_secs, end_secs)，
+-- 起止非负整数且起点 < 终点；可登记重叠区间，核算时按并集只计一次。
+-- 配置整体替换维护；任何变动推进赛事修订号，发布时随配置/成绩一并冻结。
+CREATE TABLE IF NOT EXISTS stoppage_interval (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  start_secs INTEGER NOT NULL CHECK (start_secs >= 0),
+  end_secs   INTEGER NOT NULL CHECK (end_secs >= 0 AND end_secs > start_secs)
+);
+
 CREATE TABLE IF NOT EXISTS runner (
   bib  TEXT PRIMARY KEY,
   name TEXT
@@ -77,12 +86,15 @@ CREATE TABLE IF NOT EXISTS publication (
 );
 
 -- 发布版成绩（便于排名查询），历史版永不被后续更正修改
+-- net_elapsed 为发布当时冻结的净耗时（原始耗时扣除停表并集与出发-终点区间交长）；
+-- 早于停表功能发布的历史版该列为 NULL。
 CREATE TABLE IF NOT EXISTS published_result (
   publication_version INTEGER NOT NULL REFERENCES publication(version),
   bib      TEXT NOT NULL,
   name     TEXT,
   status   TEXT NOT NULL,
   elapsed  INTEGER,
+  net_elapsed INTEGER,
   fail_at  TEXT,
   detail   TEXT,
   rank_no  INTEGER,

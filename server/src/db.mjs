@@ -21,6 +21,7 @@ export function initDb(db = getDb()) {
   const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf8');
   db.exec(schema);
   migratePunchOriginals(db);
+  migratePublishedNetElapsed(db);
 }
 
 /**
@@ -50,6 +51,15 @@ function migratePunchOriginals(db) {
                ORDER BY a.id LIMIT 1), seconds),
             orig_kind = kind`
   ).run();
+}
+
+/**
+ * 旧库迁移：为 published_result 增补「净耗时」列（停表功能上线前的历史版为 NULL）。
+ * 幂等：列已存在时直接返回。
+ */
+function migratePublishedNetElapsed(db) {
+  const cols = db.prepare('PRAGMA table_info(published_result)').all().map((c) => c.name);
+  if (!cols.includes('net_elapsed')) db.exec('ALTER TABLE published_result ADD COLUMN net_elapsed INTEGER');
 }
 
 /** 推进赛事修订号并返回新值（任何配置/读数/更正变化都使旧修订过期） */
